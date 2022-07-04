@@ -4,10 +4,12 @@ define([
     "lib/lodash",
     "text!app/templates/main.html",
     "i18n!app/nls/main",
+    "i18n!app/nls/notifications",
     "app/settings",
     "app/setupWizard",
     "text!app/templates/updatePopup.html",
-    "app/monitor",
+    "app/connection",
+    "app/statistics",
     "app/driverList",
     "app/uploadPreset",
     "app/languageSelector",
@@ -23,10 +25,12 @@ define([
     _,
     mainTemplate,
     i18n,
+    i18nNotifications,
     Settings,
     SetupWizard,
     updatePopup,
-    Monitor,
+    Connection,
+    Statistics,
     driverList,
     uploadPreset,
     languageSelector,
@@ -37,6 +41,8 @@ define([
     $(function () {
         const compiledTemplate = _.template(mainTemplate);
         const template = compiledTemplate(i18n);
+
+        let statistics = null;
 
         function checkForUpdate(settings, delay) {
             if (serverOs != "windows") {
@@ -204,19 +210,164 @@ define([
             }
         }
 
+        function logInit() {
+            const url = window.location.href;
+            const arr = url.split("/");
+
+            const log_listener = new WebSocket("ws://" + arr[2] + "/api/log");
+
+            log_listener.onopen = (ev) => {
+                console.log("Log listener started");
+            };
+
+            log_listener.onerror = (ev) => {
+                console.log("Log error", ev);
+            };
+
+            log_listener.onclose = (ev) => {
+                console.log("Log closed", ev);
+                logInit();
+            };
+
+            log_listener.addEventListener("message", function (e) {
+                addLogLine(e.data);
+            });
+
+            $("#_root_extra_notificationLevel-choice-").change((ev) => {
+                initNotificationLevel();
+            });
+        }
+        
+        function initNotificationLevel() {
+            const level = $("input[name='notificationLevel']:checked").val();
+
+            switch (level) {
+                case "error":
+                    notificationLevels = ["[ERROR]"];
+                    break;
+                case "warning":
+                    notificationLevels = ["[ERROR]", "[WARN]"];
+                    break;
+                case "info":
+                    notificationLevels = ["[ERROR]", "[WARN]", "[INFO]"];
+                    break;
+                case "debug":
+                    notificationLevels = ["[ERROR]", "[WARN]", "[INFO]", "[DEBUG]"];
+                    break;
+                default:
+                    notificationLevels = [];
+                    break;
+            }
+        }
+        
+        function addLogLine(line) {
+            let idObject = undefined;
+
+            console.log(line);
+
+            const json_start_idx = line.indexOf("#{");
+            const json_end_idx = line.indexOf("}#");
+            if (json_start_idx != -1 && json_end_idx != -1) {
+                idObject = line.substring(json_start_idx + 1, json_end_idx + 1);
+            }
+
+            const split = line.split(" ");
+            line = line.replace(split[0] + " " + split[1], "");
+
+            const skipWithoutId = $("#_root_extra_excludeNotificationsWithoutId").prop("checked");
+
+            let addToTable = true;
+            if (idObject !== undefined) {
+                idObject = JSON.parse(idObject);
+
+                statistics.handleJson(idObject);
+                switch (idObject.id) {
+                    case "Statistics":
+                        addToTable = false;
+                        break;
+                    case "GraphStatistics":
+                        addToTable = false;
+                        break;
+                    default:
+                        line = idObject.id;
+                        break;
+                }
+            }
+
+            if (notificationLevels.includes(split[1].trim())) {
+                if (!(skipWithoutId && idObject === undefined) && Lobibox.notify.list.length < 2) {
+                    Lobibox.notify(getNotificationType(split[1]), {
+                        size: "mini",
+                        rounded: true,
+                        delayIndicator: false,
+                        sound: false,
+                        position: "bottom left",
+                        title: getI18nNotification(idObject, line, split[1]).title,
+                        msg: getI18nNotification(idObject, line, split[1]).msg,
+                    });
+                }
+            }
+
+            if (addToTable) {
+                const row = `<tr><td>${split[0]}</td><td>${
+                    split[1]
+                }</td><td>${line.trim()}</td></tr>`;
+                $("#loggingTable").append(row);
+                if ($("#loggingTable").children().length > 500) {
+                    $("#loggingTable tr").first().remove();
+                }
+            }
+        }
+        
+        function getI18nNotification(idObject, line, level) {
+            if (idObject === undefined) {
+                return { title: level, msg: line };
+            } else {
+                //TODO: line could contain additional info for the msg
+
+                if (i18nNotifications[idObject.id + ".title"] !== undefined) {
+                    return {
+                        title: i18nNotifications[idObject.id + ".title"],
+                        msg: i18nNotifications[idObject.id + ".msg"],
+                    };
+                } else {
+                    console.log("Notification with additional info: ", idObject.id);
+                    return { title: level, msg: idObject.id + ": " + line };
+                }
+            }
+        }
+
+        function getNotificationType(logSeverity) {
+            switch (logSeverity.trim()) {
+                case "[ERROR]":
+                    return "error";
+                case "[WARN]":
+                    return "warning";
+                case "[INFO]":
+                    return "info";
+                case "[DEBUG]":
+                    return "default";
+                default:
+                    return "default";
+            }
+        }
+
         $("#bodyContent").append(template);
         $(document).ready(() => {
             $("#loading").remove();
             let settings = null;
             let wizard = null;
-            let monitor = null;
+            let connection = null;
             let language = null;
             try {
                 settings = new Settings();
                 checkForUpdate(settings, -1);
                 wizard = new SetupWizard(settings);
-                monitor = new Monitor(settings);
+                connection = new Connection(settings);
+                statistics = new Statistics(settings);
                 language = new languageSelector(settings);
+                logInit();
+                initNotificationLevel();
             } catch (error) {
                 Lobibox.notify("error", {
                     rounded: true,

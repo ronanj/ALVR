@@ -6,8 +6,14 @@
         <ul id="menu-content" class="list-group menu-content ">
 
             <li>
-                <a href="#monitor" data-toggle="tab">
-                    <i class="fas fa-tachometer-alt"></i> <%= monitor%>
+                <a href="#connection" data-toggle="tab">
+                    <i class="fa fa-link fa-lg"></i> <%= connection%>
+                </a>
+            </li>
+
+            <li>
+                <a href="#statistics" data-toggle="tab">
+                    <i class="fa fa-chart-line fa-lg"></i> <%= statistics%>
                 </a>
             </li>
 
@@ -20,6 +26,12 @@
             <li>
                 <a href="#installation" data-toggle="tab">
                     <i class="fa fa-hdd fa-lg"></i> <%= installation%>
+                </a>
+            </li>
+
+            <li>
+                <a href="#logs" data-toggle="tab">
+                    <i class="fa fa-table fa-lg"></i> <%= logs%>
                 </a>
             </li>
 
@@ -61,11 +73,16 @@
 
     <div class="contentHeight">
         <div class="tab-content contentHeight">
-            <div class="tab-pane alvrSection contentHeight active" id="monitor">
+            <div class="tab-pane alvrSection contentHeight active" id="connection">
+                <h2><%= connection%></h2>
+            </div>
 
+            <div class="tab-pane alvrSection fade noselect contentHeight" id="statistics">
+                <h2><%= statistics%></h2>
             </div>
 
             <div class="tab-pane alvrSection fade noselect contentHeight" id="config">
+                <h2><%= settings%></h2>
                 <div class="row contentHeight">
                     <div class="cm-md-1 contentHeight" id="configContainer">
                         <ul class="nav nav-tabs" id="configTabs">
@@ -83,6 +100,7 @@
             </div>
 
             <div class="tab-pane alvrSection fade" id="installation">
+                <h2><%= installation%></h2>
                 <button id="runSetupWizard" type="button" class="btn btn-primary"> <%= runSetupWizard%> </button>
                 <br /> <br />
                 <button id="addFirewallRules" type="button" class="btn btn-primary"> <%= addFirewallRules%> </button>
@@ -91,9 +109,16 @@
                 <div id="registeredDriversInst"></div>
             </div>
 
+            <div class="tab-pane alvrSection fade contentHeight" id="logs">
+                <h2><%= logs%></h2>
+                <table id="loggingTable">
+                </table>
+            </div>
+
             <div class="tab-pane alvrSection fade" id="about">
+                <h2><%= about%></h2>
                 <br />
-                <h3>ALVR server <span id="version"></span></h3>
+                <h4>ALVR server <span id="version"></span></h4>
                 <%= aboutText%>
                 <br /> <br />
                 <button id="openReleasePage" type="button" class="btn btn-primary"><%= openReleasePage%></button>
