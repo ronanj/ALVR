@@ -4,12 +4,12 @@ use crate::{
     connection_utils::{self, ConnectionError},
     platform,
     statistics::StatisticsManager,
-    AlvrEvent, VideoFrame, CONTROL_CHANNEL_SENDER, DECODER_REF, EVENT_BUFFER, IDR_PARSED,
-    STATISTICS_MANAGER, STATISTICS_SENDER, TRACKING_SENDER,
+    AlvrEvent, VideoFrame, CONTROL_CHANNEL_SENDER, DECODER_DEQUEUER, DECODER_ENQUEUER,
+    EVENT_BUFFER, STATISTICS_MANAGER, STATISTICS_SENDER, TRACKING_SENDER, DECODER_INIT_CONFIG,
 };
 use alvr_audio::{AudioDevice, AudioDeviceType};
 use alvr_common::{prelude::*, ALVR_NAME, ALVR_VERSION};
-use alvr_session::{AudioDeviceId, CodecType, OculusFovetionLevel, SessionDesc};
+use alvr_session::{AudioDeviceId, CodecType, OculusFovetionLevel, SessionDesc, MediacodecDataType};
 use alvr_sockets::{
     spawn_cancelable, ClientConfigPacket, ClientControlPacket, ClientHandshakePacket, Haptics,
     HeadsetInfoPacket, PeerType, ProtoControlSocket, ServerControlPacket, ServerHandshakePacket,
@@ -298,6 +298,24 @@ async fn connection_pipeline(headset_info: &HeadsetInfoPacket) -> StrResult {
     let (control_channel_sender, mut control_channel_receiver) = tmpsc::unbounded_channel();
     *CONTROL_CHANNEL_SENDER.lock() = Some(control_channel_sender);
 
+    {
+        let config = &mut *DECODER_INIT_CONFIG.lock();
+
+        config.codec = settings.video.codec;
+
+        config.options = vec![
+            ("operating-rate".into(), MediacodecDataType::Int32(i32::MAX)),
+            ("priority".into(), MediacodecDataType::Int32(0)),
+            // low-latency: only applicable on API level 30. Quest 1 and 2 might not be
+            // cabable, since they are on level 29.
+            ("low-latency".into(), MediacodecDataType::Int32(1)),
+            (
+                "vendor.qti-ext-dec-low-latency.enable".into(),
+                MediacodecDataType::Int32(1),
+            ),
+        ];
+    }
+
     unsafe {
         crate::setStreamConfig(crate::StreamConfigInput {
             eyeWidth: config_packet.eye_resolution_width,
@@ -501,37 +519,18 @@ async fn connection_pipeline(headset_info: &HeadsetInfoPacket) -> StrResult {
                 // Note: legacyReceive() requires the java context to be attached to the current thread
                 // todo: investigate why
                 let vm = platform::vm();
-                let env = vm.attach_current_thread().unwrap();
+                let _env = vm.attach_current_thread().unwrap();
 
                 crate::initializeSocket(matches!(codec, CodecType::HEVC) as _, enable_fec);
 
-                let mut idr_request_deadline = None;
-
                 while let Ok(mut data) = legacy_receive_data_receiver.recv() {
-                    // Send again IDR packet every 2s in case it is missed
-                    // (due to dropped burst of packets at the start of the stream or otherwise).
-                    if !IDR_PARSED.load(Ordering::Relaxed) {
-                        if let Some(deadline) = idr_request_deadline {
-                            if deadline < Instant::now() {
-                                if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-                                    sender.send(ClientControlPacket::RequestIdr).ok();
-                                }
-                                idr_request_deadline = None;
-                            }
-                        } else {
-                            idr_request_deadline = Some(Instant::now() + Duration::from_secs(2));
-                        }
-                    }
-
                     crate::legacyReceive(data.as_mut_ptr(), data.len() as _);
                 }
 
                 crate::closeSocket();
 
-                if let Some(decoder) = &*DECODER_REF.lock() {
-                    env.call_method(decoder.as_obj(), "onDisconnect", "()V", &[])
-                        .unwrap();
-                }
+                *DECODER_ENQUEUER.lock() = None;
+                *DECODER_DEQUEUER.lock() = None;
             }
 
             Ok(())
@@ -629,13 +628,13 @@ async fn connection_pipeline(headset_info: &HeadsetInfoPacket) -> StrResult {
 
             Ok(())
         },
-        res = spawn_cancelable(game_audio_loop) => res,
-        res = spawn_cancelable(microphone_loop) => res,
-        res = spawn_cancelable(tracking_send_loop) => res,
-        res = spawn_cancelable(statistics_send_loop) => res,
-        res = spawn_cancelable(video_receive_loop) => res,
-        res = spawn_cancelable(haptics_receive_loop) => res,
-        res = spawn_cancelable(control_send_loop) => res,
+        res = game_audio_loop => res,
+        res = microphone_loop => res,
+        res = tracking_send_loop => res,
+        res = statistics_send_loop => res,
+        res = video_receive_loop => res,
+        res = haptics_receive_loop => res,
+        res = control_send_loop => res,
         res = legacy_stream_socket_loop => res.map_err(err!())?,
 
         // keep these loops on the current task

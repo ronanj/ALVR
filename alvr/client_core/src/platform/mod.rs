@@ -9,7 +9,11 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 // #[cfg(target_os = "android")]
-pub use android::{context, device_name, load_asset, try_get_microphone_permission, vm};
+pub use android::{
+    alvr_surface_texture_frame_available, context, device_name, load_asset,
+    try_get_microphone_permission, video_decoder_split, vm, VideoDecoderDequeuer,
+    VideoDecoderEnqueuer, REGISTER_SURFACE_TEXTURE_ON_FRAME_READY,
+};
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {

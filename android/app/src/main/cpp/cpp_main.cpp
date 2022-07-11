@@ -7,30 +7,30 @@
 #include <GLES3/gl3.h>
 #include <android/log.h>
 #include <android/native_window_jni.h>
+#include <chrono>
 #include <map>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
-int gGeneralLogLevel = ANDROID_LOG_INFO;
-#define LOG(...)                                                                                   \
-    do {                                                                                           \
-        if (gGeneralLogLevel <= ANDROID_LOG_VERBOSE) {                                             \
-            __android_log_print(ANDROID_LOG_VERBOSE, "ALVR Native", __VA_ARGS__);                  \
-        }                                                                                          \
-    } while (false)
-#define LOGI(...)                                                                                  \
-    do {                                                                                           \
-        if (gGeneralLogLevel <= ANDROID_LOG_INFO) {                                                \
-            __android_log_print(ANDROID_LOG_INFO, "ALVR Native", __VA_ARGS__);                     \
-        }                                                                                          \
-    } while (false)
-#define LOGE(...)                                                                                  \
-    do {                                                                                           \
-        if (gGeneralLogLevel <= ANDROID_LOG_ERROR) {                                               \
-            __android_log_print(ANDROID_LOG_ERROR, "ALVR Native", __VA_ARGS__);                    \
-        }                                                                                          \
-    } while (false)
+void log(AlvrLogLevel level, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    char buf[1024];
+    int count = vsnprintf(buf, sizeof(buf), format, args);
+    if (count > (int) sizeof(buf))
+        count = (int) sizeof(buf);
+    if (count > 0 && buf[count - 1] == '\n')
+        buf[count - 1] = '\0';
+
+    alvr_log(level, buf);
+
+    va_end(args);
+}
+
+#define error(...) log(ALVR_LOG_LEVEL_ERROR, __VA_ARGS__)
+#define info(...) log(ALVR_LOG_LEVEL_INFO, __VA_ARGS__)
 
 inline uint64_t getTimestampUs() {
     timeval tv;
@@ -50,8 +50,8 @@ struct Render_EGL {
 
 Render_EGL egl;
 
-static const char *EglErrorString(const EGLint error) {
-    switch (error) {
+static const char *EglErrorString(const EGLint err) {
+    switch (err) {
         case EGL_SUCCESS:
             return "EGL_SUCCESS";
         case EGL_NOT_INITIALIZED:
@@ -100,7 +100,7 @@ void eglInit() {
     EGLConfig configs[MAX_CONFIGS];
     EGLint numConfigs = 0;
     if (eglGetConfigs(egl.Display, configs, MAX_CONFIGS, &numConfigs) == EGL_FALSE) {
-        LOGE("        eglGetConfigs() failed: %s", EglErrorString(eglGetError()));
+        error("        eglGetConfigs() failed: %s", EglErrorString(eglGetError()));
         return;
     }
     const EGLint configAttribs[] = {EGL_RED_SIZE,
@@ -147,28 +147,25 @@ void eglInit() {
         }
     }
     if (egl.Config == 0) {
-        LOGE("        eglChooseConfig() failed: %s", EglErrorString(eglGetError()));
+        error("        eglChooseConfig() failed: %s", EglErrorString(eglGetError()));
         return;
     }
     EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-    LOG("        Context = eglCreateContext( Display, Config, EGL_NO_CONTEXT, contextAttribs )");
     egl.Context = eglCreateContext(egl.Display, egl.Config, EGL_NO_CONTEXT, contextAttribs);
     if (egl.Context == EGL_NO_CONTEXT) {
-        LOGE("        eglCreateContext() failed: %s", EglErrorString(eglGetError()));
+        error("        eglCreateContext() failed: %s", EglErrorString(eglGetError()));
         return;
     }
     const EGLint surfaceAttribs[] = {EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE};
-    LOG("        TinySurface = eglCreatePbufferSurface( Display, Config, surfaceAttribs )");
     egl.TinySurface = eglCreatePbufferSurface(egl.Display, egl.Config, surfaceAttribs);
     if (egl.TinySurface == EGL_NO_SURFACE) {
-        LOGE("        eglCreatePbufferSurface() failed: %s", EglErrorString(eglGetError()));
+        error("        eglCreatePbufferSurface() failed: %s", EglErrorString(eglGetError()));
         eglDestroyContext(egl.Display, egl.Context);
         egl.Context = EGL_NO_CONTEXT;
         return;
     }
-    LOG("        eglMakeCurrent( Display, TinySurface, TinySurface, Context )");
     if (eglMakeCurrent(egl.Display, egl.TinySurface, egl.TinySurface, egl.Context) == EGL_FALSE) {
-        LOGE("        eglMakeCurrent() failed: %s", EglErrorString(eglGetError()));
+        error("        eglMakeCurrent() failed: %s", EglErrorString(eglGetError()));
         eglDestroySurface(egl.Display, egl.TinySurface);
         eglDestroyContext(egl.Display, egl.Context);
         egl.Context = EGL_NO_CONTEXT;
@@ -178,30 +175,30 @@ void eglInit() {
 
 void eglDestroy() {
     if (egl.Display != 0) {
-        LOGE("        eglMakeCurrent( Display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT )");
+        error("        eglMakeCurrent( Display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT )");
         if (eglMakeCurrent(egl.Display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) ==
             EGL_FALSE) {
-            LOGE("        eglMakeCurrent() failed: %s", EglErrorString(eglGetError()));
+            error("        eglMakeCurrent() failed: %s", EglErrorString(eglGetError()));
         }
     }
     if (egl.Context != EGL_NO_CONTEXT) {
-        LOGE("        eglDestroyContext( Display, Context )");
+        error("        eglDestroyContext( Display, Context )");
         if (eglDestroyContext(egl.Display, egl.Context) == EGL_FALSE) {
-            LOGE("        eglDestroyContext() failed: %s", EglErrorString(eglGetError()));
+            error("        eglDestroyContext() failed: %s", EglErrorString(eglGetError()));
         }
         egl.Context = EGL_NO_CONTEXT;
     }
     if (egl.TinySurface != EGL_NO_SURFACE) {
-        LOGE("        eglDestroySurface( Display, TinySurface )");
+        error("        eglDestroySurface( Display, TinySurface )");
         if (eglDestroySurface(egl.Display, egl.TinySurface) == EGL_FALSE) {
-            LOGE("        eglDestroySurface() failed: %s", EglErrorString(eglGetError()));
+            error("        eglDestroySurface() failed: %s", EglErrorString(eglGetError()));
         }
         egl.TinySurface = EGL_NO_SURFACE;
     }
     if (egl.Display != 0) {
-        LOGE("        eglTerminate( Display )");
+        error("        eglTerminate( Display )");
         if (eglTerminate(egl.Display) == EGL_FALSE) {
-            LOGE("        eglTerminate() failed: %s", EglErrorString(eglGetError()));
+            error("        eglTerminate() failed: %s", EglErrorString(eglGetError()));
         }
         egl.Display = 0;
     }
@@ -247,7 +244,8 @@ uint64_t RIGHT_THUMBSTICK_TOUCH;
 uint64_t RIGHT_THUMBREST_TOUCH;
 
 const int MAXIMUM_TRACKING_FRAMES = 360;
-const float BUTTON_EPS = 0.001; // minimum change for a scalar button to be registered as a new value
+const float BUTTON_EPS =
+        0.001;                   // minimum change for a scalar button to be registered as a new value
 const float IPD_EPS = 0.001; // minimum change of IPD to be registered as a new value
 
 const GLenum SWAPCHAIN_FORMAT = GL_RGBA8;
@@ -269,7 +267,7 @@ public:
     std::thread eventsThread;
     std::thread trackingThread;
 
-    float refreshRate = 60.f;
+    float refreshRate = 72.f;
     bool controllerPredictionMultiplier;
 
     uint64_t ovrFrameIndex = 0;
@@ -473,7 +471,7 @@ void finishHapticsBuffer(ovrDeviceID DeviceID) {
 
     auto result = vrapi_SetHapticVibrationBuffer(g_ctx.ovrContext, DeviceID, &buffer);
     if (result != ovrSuccess) {
-        LOGI("vrapi_SetHapticVibrationBuffer: Failed. result=%d", result);
+        info("vrapi_SetHapticVibrationBuffer: Failed. result=%d", result);
     }
 }
 
@@ -531,9 +529,6 @@ void updateHapticsState() {
 
             // First, call with buffer.Terminated = false and when haptics is no more needed call
             // with buffer.Terminated = true (to stop haptics?).
-            LOG("Send haptic buffer. HapticSamplesMax=%d HapticSampleDurationMS=%d",
-                remoteCapabilities.HapticSamplesMax,
-                remoteCapabilities.HapticSampleDurationMS);
 
             auto requiredHapticsBuffer = static_cast<uint32_t>(
                     (s.endUs - currentUs) / (remoteCapabilities.HapticSampleDurationMS * 1000));
@@ -556,12 +551,11 @@ void updateHapticsState() {
 
             result = vrapi_SetHapticVibrationBuffer(g_ctx.ovrContext, curCaps.DeviceID, &buffer);
             if (result != ovrSuccess) {
-                LOGI("vrapi_SetHapticVibrationBuffer: Failed. result=%d", result);
+                info("vrapi_SetHapticVibrationBuffer: Failed. result=%d", result);
             }
             s.buffered = true;
         } else if (remoteCapabilities.ControllerCapabilities &
                    ovrControllerCaps_HasSimpleHapticVibration) {
-            LOG("Send simple haptic. amplitude=%f", s.amplitude);
             vrapi_SetHapticVibrationSimple(g_ctx.ovrContext, curCaps.DeviceID, s.amplitude);
         }
     }
@@ -770,6 +764,16 @@ void trackingThread() {
     }
 }
 
+void registerSurfaceTextureCallback(void *surfaceTexture, int id) {
+    auto java = getOvrJava(true);
+
+    auto jclass = java.Env->GetObjectClass(g_ctx.context);
+    auto method = java.Env->GetStaticMethodID(
+            jclass, "registerSurfaceTextureCallback", "(Landroid/graphics/SurfaceTexture;I)V");
+
+    java.Env->CallStaticVoidMethod(jclass, method, (jobject) surfaceTexture, id);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_polygraphene_alvr_OvrActivity_initializeNative(JNIEnv *env, jobject context) {
     env->GetJavaVM(&g_ctx.vm);
@@ -815,14 +819,14 @@ Java_com_polygraphene_alvr_OvrActivity_initializeNative(JNIEnv *env, jobject con
 
     eglInit();
 
-    alvr_initialize((void *) g_ctx.vm, (void *) g_ctx.context);
+    alvr_initialize((void *) g_ctx.vm, (void *) g_ctx.context, registerSurfaceTextureCallback);
 
     memset(g_ctx.hapticsState, 0, sizeof(g_ctx.hapticsState));
     const ovrInitParms initParms = vrapi_DefaultInitParms(&java);
     int32_t initResult = vrapi_Initialize(&initParms);
     if (initResult != VRAPI_INITIALIZE_SUCCESS) {
         // If initialization failed, vrapi_* function calls will not be available.
-        LOGE("vrapi_Initialize failed");
+        error("vrapi_Initialize failed");
     }
 }
 
@@ -844,7 +848,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_polygraphene_alvr_OvrActivity_onResum
 
     g_ctx.window = ANativeWindow_fromSurface(java.Env, surface);
 
-    LOGI("Entering VR mode.");
+    info("Entering VR mode.");
 
     ovrModeParms parms = vrapi_DefaultModeParms(&java);
 
@@ -858,7 +862,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_polygraphene_alvr_OvrActivity_onResum
     g_ctx.ovrContext = vrapi_EnterVrMode(&parms);
 
     if (g_ctx.ovrContext == nullptr) {
-        LOGE("Invalid ANativeWindow");
+        error("Invalid ANativeWindow");
     }
 
     // set Color Space
@@ -906,13 +910,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_polygraphene_alvr_OvrActivity_onResum
                 refreshRatesCount,
                 textureHandles,
                 textureHandlesBuffer[0].size());
+
+    vrapi_SetDisplayRefreshRate(g_ctx.ovrContext, g_ctx.refreshRate);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_polygraphene_alvr_OvrActivity_onPauseNative(JNIEnv *_env, jobject _context) {
     alvr_pause();
 
-    LOGI("Leaving VR mode.");
+    info("Leaving VR mode.");
 
     if (g_ctx.streaming) {
         g_ctx.streaming = false;
@@ -952,7 +958,6 @@ Java_com_polygraphene_alvr_OvrActivity_onStreamStartNative(JNIEnv *_env,
                                                            jint eyeWidth,
                                                            jint eyeHeight,
                                                            jfloat fps,
-                                                           jobject decoder,
                                                            jint codec,
                                                            jboolean realTimeDecoder,
                                                            jint oculusFoveationLevel,
@@ -999,7 +1004,7 @@ Java_com_polygraphene_alvr_OvrActivity_onStreamStartNative(JNIEnv *_env,
 
     ovrResult result = vrapi_SetDisplayRefreshRate(g_ctx.ovrContext, fps);
     if (result != ovrSuccess) {
-        LOGE("Failed to set refresh rate requested by the server: %d", result);
+        error("Failed to set refresh rate requested by the server: %d", result);
     }
 
     vrapi_SetPropertyInt(&java, VRAPI_FOVEATION_LEVEL, oculusFoveationLevel);
@@ -1026,109 +1031,93 @@ Java_com_polygraphene_alvr_OvrActivity_onStreamStartNative(JNIEnv *_env,
     getPlayspaceArea(&areaWidth, &areaHeight);
     alvr_send_playspace(areaWidth, areaHeight);
 
-    alvr_start_stream(
-            decoder, codec, realTimeDecoder, textureHandles, textureHandlesBuffer[0].size());
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_polygraphene_alvr_OvrActivity_isConnectedNative(JNIEnv *_env, jobject _context) {
-    return alvr_is_streaming();
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_polygraphene_alvr_OvrActivity_renderLoadingNative(JNIEnv *_env, jobject _context) {
-    double displayTime = vrapi_GetPredictedDisplayTime(g_ctx.ovrContext, g_ctx.ovrFrameIndex);
-    ovrTracking2 tracking = vrapi_GetPredictedTracking2(g_ctx.ovrContext, displayTime);
-
-    AlvrEyeInput eyeInputs[2] = {trackingToEyeInput(&tracking, 0),
-                                 trackingToEyeInput(&tracking, 1)};
-    int swapchainIndices[2] = {g_ctx.loadingSwapchains[0].index, g_ctx.loadingSwapchains[1].index};
-    alvr_render_lobby(eyeInputs, swapchainIndices);
-
-    ovrLayerProjection2 worldLayer = vrapi_DefaultLayerProjection2();
-    worldLayer.HeadPose = tracking.HeadPose;
-    for (int eye = 0; eye < VRAPI_FRAME_LAYER_EYE_MAX; eye++) {
-        worldLayer.Textures[eye].ColorSwapChain = g_ctx.loadingSwapchains[eye].inner;
-        worldLayer.Textures[eye].SwapChainIndex = g_ctx.loadingSwapchains[eye].index;
-        worldLayer.Textures[eye].TexCoordsFromTanAngles =
-                ovrMatrix4f_TanAngleMatrixFromProjection(&tracking.Eye[eye].ProjectionMatrix);
-    }
-    worldLayer.Header.Flags |= VRAPI_FRAME_LAYER_FLAG_CHROMATIC_ABERRATION_CORRECTION;
-
-    const ovrLayerHeader2 *layers[] = {&worldLayer.Header};
-
-    ovrSubmitFrameDescription2 frameDesc = {};
-    frameDesc.Flags = 0;
-    frameDesc.SwapInterval = 1;
-    frameDesc.FrameIndex = g_ctx.ovrFrameIndex;
-    frameDesc.DisplayTime = displayTime;
-    frameDesc.LayerCount = 1;
-    frameDesc.Layers = layers;
-
-    vrapi_SubmitFrame2(g_ctx.ovrContext, &frameDesc);
-
-    g_ctx.loadingSwapchains[0].index = (g_ctx.loadingSwapchains[0].index + 1) % 3;
-    g_ctx.loadingSwapchains[1].index = (g_ctx.loadingSwapchains[1].index + 1) % 3;
+    alvr_start_stream(codec, realTimeDecoder, textureHandles, textureHandlesBuffer[0].size());
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_polygraphene_alvr_OvrActivity_renderNative(JNIEnv *_env, jobject _context) {
-    auto timestampNs = alvr_wait_for_frame();
-
-    if (timestampNs == -1) {
-        return;
-    }
-
-    g_ctx.ovrFrameIndex++;
-
-    updateHapticsState();
-
-    ovrTracking2 tracking;
-    {
-        std::lock_guard<std::mutex> lock(g_ctx.trackingFrameMutex);
-
-        const auto it = g_ctx.trackingFrameMap.find(timestampNs);
-        if (it != g_ctx.trackingFrameMap.end()) {
-            tracking = it->second;
-        } else {
-            if (!g_ctx.trackingFrameMap.empty())
-                tracking = g_ctx.trackingFrameMap.cbegin()->second;
-            else
-                return;
-        }
-    }
-
-    int swapchainIndices[2] = {g_ctx.streamSwapchains[0].index, g_ctx.streamSwapchains[1].index};
-    alvr_render_stream(timestampNs, swapchainIndices);
-
-    double vsyncQueueS = vrapi_GetPredictedDisplayTime(g_ctx.ovrContext, g_ctx.ovrFrameIndex) -
-                         vrapi_GetTimeInSeconds();
-    alvr_report_submit(timestampNs, vsyncQueueS * 1e9);
-
-    ovrLayerProjection2 worldLayer = vrapi_DefaultLayerProjection2();
-    worldLayer.HeadPose = tracking.HeadPose;
-    for (int eye = 0; eye < VRAPI_FRAME_LAYER_EYE_MAX; eye++) {
-        worldLayer.Textures[eye].ColorSwapChain = g_ctx.streamSwapchains[eye].inner;
-        worldLayer.Textures[eye].SwapChainIndex = g_ctx.streamSwapchains[eye].index;
-        worldLayer.Textures[eye].TexCoordsFromTanAngles =
-                ovrMatrix4f_TanAngleMatrixFromProjection(&tracking.Eye[eye].ProjectionMatrix);
-    }
-    worldLayer.Header.Flags |= VRAPI_FRAME_LAYER_FLAG_CHROMATIC_ABERRATION_CORRECTION;
-
-    const ovrLayerHeader2 *layers2[] = {&worldLayer.Header};
-
     ovrSubmitFrameDescription2 frameDesc = {};
     frameDesc.Flags = 0;
     frameDesc.SwapInterval = 1;
     frameDesc.FrameIndex = g_ctx.ovrFrameIndex;
-    frameDesc.DisplayTime = (double) timestampNs / 1e9;
     frameDesc.LayerCount = 1;
-    frameDesc.Layers = layers2;
 
+    ovrLayerProjection2 worldLayer = vrapi_DefaultLayerProjection2();
+
+    if (alvr_is_streaming()) {
+        auto timestampNs = alvr_wait_for_frame();
+
+        if (timestampNs == -1) {
+            return;
+        }
+
+        updateHapticsState();
+
+        ovrTracking2 tracking;
+        {
+            std::lock_guard<std::mutex> lock(g_ctx.trackingFrameMutex);
+
+            const auto it = g_ctx.trackingFrameMap.find(timestampNs);
+            if (it != g_ctx.trackingFrameMap.end()) {
+                tracking = it->second;
+            } else {
+                if (!g_ctx.trackingFrameMap.empty())
+                    tracking = g_ctx.trackingFrameMap.cbegin()->second;
+                else
+                    return;
+            }
+        }
+
+        int swapchainIndices[2] = {g_ctx.streamSwapchains[0].index,
+                                   g_ctx.streamSwapchains[1].index};
+        alvr_render_stream(swapchainIndices);
+
+        double vsyncQueueS = vrapi_GetPredictedDisplayTime(g_ctx.ovrContext, g_ctx.ovrFrameIndex) -
+                             vrapi_GetTimeInSeconds();
+        alvr_report_submit(timestampNs, vsyncQueueS * 1e9);
+
+        worldLayer.HeadPose = tracking.HeadPose;
+        for (int eye = 0; eye < 2; eye++) {
+            worldLayer.Textures[eye].ColorSwapChain = g_ctx.streamSwapchains[eye].inner;
+            worldLayer.Textures[eye].SwapChainIndex = g_ctx.streamSwapchains[eye].index;
+            worldLayer.Textures[eye].TexCoordsFromTanAngles =
+                    ovrMatrix4f_TanAngleMatrixFromProjection(&tracking.Eye[eye].ProjectionMatrix);
+
+            g_ctx.streamSwapchains[eye].index = (g_ctx.streamSwapchains[eye].index + 1) % 3;
+        }
+
+        frameDesc.DisplayTime = (double) timestampNs / 1e9;
+    } else {
+        double displayTime = vrapi_GetPredictedDisplayTime(g_ctx.ovrContext, g_ctx.ovrFrameIndex);
+        ovrTracking2 tracking = vrapi_GetPredictedTracking2(g_ctx.ovrContext, displayTime);
+
+        AlvrEyeInput eyeInputs[2] = {trackingToEyeInput(&tracking, 0),
+                                     trackingToEyeInput(&tracking, 1)};
+        int swapchainIndices[2] = {g_ctx.loadingSwapchains[0].index,
+                                   g_ctx.loadingSwapchains[1].index};
+        alvr_render_lobby(eyeInputs, swapchainIndices);
+
+        worldLayer.HeadPose = tracking.HeadPose;
+        for (int eye = 0; eye < 2; eye++) {
+            worldLayer.Textures[eye].ColorSwapChain = g_ctx.loadingSwapchains[eye].inner;
+            worldLayer.Textures[eye].SwapChainIndex = g_ctx.loadingSwapchains[eye].index;
+            worldLayer.Textures[eye].TexCoordsFromTanAngles =
+                    ovrMatrix4f_TanAngleMatrixFromProjection(&tracking.Eye[eye].ProjectionMatrix);
+
+            g_ctx.loadingSwapchains[eye].index = (g_ctx.loadingSwapchains[eye].index + 1) % 3;
+        }
+
+        frameDesc.DisplayTime = displayTime;
+    }
+
+    const ovrLayerHeader2 *layers[] = {&worldLayer.Header};
+    frameDesc.Layers = layers;
+
+    // Note: this call will try to take as much time as possible to reach the target framerate.
+    // Sleep to avoid starving other threads
     vrapi_SubmitFrame2(g_ctx.ovrContext, &frameDesc);
 
-    g_ctx.streamSwapchains[0].index = (g_ctx.streamSwapchains[0].index + 1) % 3;
-    g_ctx.streamSwapchains[1].index = (g_ctx.streamSwapchains[1].index + 1) % 3;
+    g_ctx.ovrFrameIndex++;
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_polygraphene_alvr_OvrActivity_onBatteryChangedNative(
@@ -1138,22 +1127,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_polygraphene_alvr_OvrActivity_onBatte
     g_ctx.hmdPlugged = plugged;
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_polygraphene_alvr_DecoderThread_setWaitingNextIDR(
-        JNIEnv *_env, jclass _class, jboolean waiting) {
-    alvr_set_waiting_next_idr(waiting);
-}
-
 extern "C" JNIEXPORT void JNICALL
-Java_com_polygraphene_alvr_DecoderThread_requestIDR(JNIEnv *_env, jclass _class) {
-    alvr_request_idr();
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_polygraphene_alvr_DecoderThread_restartRenderCycle(JNIEnv *_env, jclass _class) {
-    alvr_restart_rendering_cycle();
-}
-
-extern "C" JNIEXPORT jint JNICALL
-Java_com_polygraphene_alvr_DecoderThread_getStreamTextureHandle(JNIEnv *_env, jclass _class) {
-    return alvr_get_stream_texture_handle();
+Java_com_polygraphene_alvr_OvrActivity_surfaceTextureFrameAvailable(JNIEnv *env,
+                                                                    jclass clazz,
+                                                                    jint id) {
+    alvr_surface_texture_frame_available(id);
 }

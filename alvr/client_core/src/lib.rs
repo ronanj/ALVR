@@ -20,12 +20,16 @@ use alvr_common::{
     ALVR_VERSION,
 };
 use alvr_events::ButtonValue;
-use alvr_session::{AudioDeviceId, Fov};
+use alvr_session::{AudioDeviceId, CodecType, Fov, MediacodecDataType};
 use alvr_sockets::{
     BatteryPacket, ClientControlPacket, ClientStatistics, DeviceMotion, HeadsetInfoPacket,
     Tracking, ViewsConfig,
 };
-use jni::objects::{GlobalRef, ReleaseMode};
+use jni::{
+    objects::{GlobalRef, ReleaseMode},
+    sys::jobject,
+};
+use platform::{VideoDecoderDequeuer, VideoDecoderEnqueuer};
 use statistics::StatisticsManager;
 use std::{
     collections::VecDeque,
@@ -33,9 +37,16 @@ use std::{
     os::raw::c_char,
     ptr, slice,
     sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
-use tokio::{runtime::Runtime, sync::mpsc, sync::Notify};
+use tokio::{
+    runtime::{self, Runtime},
+    sync::mpsc,
+    sync::Notify,
+};
+
+use crate::platform::REGISTER_SURFACE_TEXTURE_ON_FRAME_READY;
 
 // This is the actual storage for the context pointer set in ndk-context. usually stored in
 // ndk-glue instead
@@ -52,11 +63,23 @@ static CONTROL_CHANNEL_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<ClientCon
     Lazy::new(|| Mutex::new(None));
 static ON_PAUSE_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 
-static DECODER_REF: Lazy<Mutex<Option<GlobalRef>>> = Lazy::new(|| Mutex::new(None));
-static IDR_PARSED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
-static STREAM_TEAXTURE_HANDLE: Lazy<Mutex<i32>> = Lazy::new(|| Mutex::new(0));
-
 static EVENT_BUFFER: Lazy<Mutex<VecDeque<AlvrEvent>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+
+pub struct DecoderInitConfig {
+    codec: CodecType,
+    options: Vec<(String, MediacodecDataType)>,
+    gl_surface_handle: i32,
+}
+
+pub static DECODER_INIT_CONFIG: Lazy<Mutex<DecoderInitConfig>> = Lazy::new(|| {
+    Mutex::new(DecoderInitConfig {
+        codec: CodecType::H264,
+        options: vec![],
+        gl_surface_handle: 0,
+    })
+});
+static DECODER_ENQUEUER: Lazy<Mutex<Option<VideoDecoderEnqueuer>>> = Lazy::new(|| Mutex::new(None));
+static DECODER_DEQUEUER: Lazy<Mutex<Option<VideoDecoderDequeuer>>> = Lazy::new(|| Mutex::new(None));
 
 #[repr(u8)]
 pub enum AlvrEvent {
@@ -115,16 +138,49 @@ pub enum AlvrButtonValue {
     Scalar(f32),
 }
 
+#[repr(C)]
+pub enum AlvrLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn alvr_path_string_to_hash(path: *const c_char) -> u64 {
     alvr_common::hash_string(CStr::from_ptr(path).to_str().unwrap())
 }
 
+#[no_mangle]
+pub extern "C" fn alvr_log(level: AlvrLogLevel, message: *const c_char) {
+    let message = unsafe { CStr::from_ptr(message) }.to_str().unwrap();
+    match level {
+        AlvrLogLevel::Error => error!("ALVR native: {message}"),
+        AlvrLogLevel::Warn => warn!("ALVR native: {message}"),
+        AlvrLogLevel::Info => info!("ALVR native: {message}"),
+        AlvrLogLevel::Debug => debug!("ALVR native: {message}"),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn alvr_log_time(tag: *const c_char) {
+    let tag = unsafe { CStr::from_ptr(tag) }.to_str().unwrap();
+    error!("ALVR native: {tag}: {:?}", Instant::now());
+}
+
 // NB: context must be thread safe.
 #[no_mangle]
-pub extern "C" fn alvr_initialize(java_vm: *mut c_void, context: *mut c_void) {
+pub extern "C" fn alvr_initialize(
+    java_vm: *mut c_void,
+    context: *mut c_void,
+    register_surface_texture_on_frame_ready: extern "C" fn(*mut c_void, i32),
+) {
     unsafe { ndk_context::initialize_android_context(java_vm, context) };
     logging_backend::init_logging();
+
+    REGISTER_SURFACE_TEXTURE_ON_FRAME_READY
+        .set(register_surface_texture_on_frame_ready)
+        .unwrap();
 
     extern "C" fn video_error_report_send() {
         if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
@@ -132,63 +188,48 @@ pub extern "C" fn alvr_initialize(java_vm: *mut c_void, context: *mut c_void) {
         }
     }
 
+    extern "C" fn create_decoder(buffer: *const c_char, length: i32) {
+        if DECODER_ENQUEUER.lock().is_none() {
+            let mut csd_0 = vec![0; length as _];
+            unsafe { ptr::copy_nonoverlapping(buffer, csd_0.as_mut_ptr(), length as _) };
+
+            let config = DECODER_INIT_CONFIG.lock();
+
+            let (enqueuer, dequeuer) = platform::video_decoder_split(
+                config.codec,
+                &csd_0,
+                &config.options,
+                config.gl_surface_handle,
+            )
+            .unwrap();
+
+            *DECODER_ENQUEUER.lock() = Some(enqueuer);
+            *DECODER_DEQUEUER.lock() = Some(dequeuer);
+
+            if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
+                sender.send(ClientControlPacket::RequestIdr).ok();
+            }
+        }
+    }
+
     extern "C" fn push_nal(buffer: *const c_char, length: i32, frame_index: u64) {
-        let vm = platform::vm();
-        let env = vm.get_env().unwrap();
+        if let Some(decoder) = &*DECODER_ENQUEUER.lock() {
+            let timestamp = Duration::from_nanos(frame_index);
 
-        let decoder_lock = DECODER_REF.lock();
+            // todo: check is copy can be avoided
+            let mut nal_buffer = vec![0; length as _];
+            unsafe { ptr::copy_nonoverlapping(buffer, nal_buffer.as_mut_ptr(), length as _) }
 
-        let mut nal = if let Some(decoder) = &*decoder_lock {
-            env.call_method(
-                decoder,
-                "obtainNAL",
-                "(I)Lcom/polygraphene/alvr/NAL;",
-                &[length.into()],
-            )
-            .unwrap()
-            .l()
-            .unwrap()
-        } else {
-            return;
-        };
-
-        if nal.is_null() {
-            let nal_class = env.find_class("com/polygraphene/alvr/NAL").unwrap();
-            nal = env
-                .new_object(
-                    nal_class,
-                    "(I)Lcom/polygraphene/alvr/NAL;",
-                    &[length.into()],
-                )
-                .unwrap();
-        }
-
-        env.set_field(nal, "length", "I", length.into()).unwrap();
-        env.set_field(nal, "frameIndex", "J", (frame_index as i64).into())
-            .unwrap();
-        {
-            let jarray = env.get_field(nal, "buf", "[B").unwrap().l().unwrap();
-            let jbuffer = env
-                .get_byte_array_elements(*jarray, ReleaseMode::CopyBack)
-                .unwrap();
-            unsafe { ptr::copy_nonoverlapping(buffer as _, jbuffer.as_ptr(), length as usize) };
-            jbuffer.commit().unwrap();
-        }
-
-        if let Some(decoder) = &*decoder_lock {
-            env.call_method(
-                decoder,
-                "pushNAL",
-                "(Lcom/polygraphene/alvr/NAL;)V",
-                &[nal.into()],
-            )
-            .unwrap();
+            show_err(decoder.push_frame_nal(timestamp, &nal_buffer, Duration::from_millis(500)));
+        } else if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
+            sender.send(ClientControlPacket::RequestIdr).ok();
         }
     }
 
     unsafe {
         pathStringToHash = Some(alvr_path_string_to_hash);
         videoErrorReportSend = Some(video_error_report_send);
+        createDecoder = Some(create_decoder);
         pushNal = Some(push_nal);
     }
 
@@ -222,7 +263,7 @@ pub extern "C" fn alvr_initialize(java_vm: *mut c_void, context: *mut c_void) {
             *asset_manager.as_obj() as _,
         )
     };
-    *STREAM_TEAXTURE_HANDLE.lock() = result.streamSurfaceHandle;
+    DECODER_INIT_CONFIG.lock().gl_surface_handle = result.streamSurfaceHandle;
 
     GLOBAL_ASSET_MANAGER
         .set(asset_manager)
@@ -273,18 +314,20 @@ pub unsafe extern "C" fn alvr_resume(
         reserved: format!("{}", *ALVR_VERSION),
     };
 
-    let runtime = Runtime::new().unwrap();
+    thread::spawn(|| {
+        let runtime = runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-    runtime.spawn(async move {
-        let connection_loop = connection::connection_lifecycle_loop(headset_info);
+        runtime.block_on(async move {
+            let connection_loop = connection::connection_lifecycle_loop(headset_info);
 
-        tokio::select! {
-            _ = connection_loop => (),
-            _ = ON_PAUSE_NOTIFIER.notified() => ()
-        };
+            tokio::select! {
+                _ = connection_loop => (),
+                _ = ON_PAUSE_NOTIFIER.notified() => ()
+            };
+        });
     });
 
-    *RUNTIME.lock() = Some(runtime);
+    // *RUNTIME.lock() = Some(runtime);
 }
 
 #[no_mangle]
@@ -295,14 +338,6 @@ pub unsafe extern "C" fn alvr_pause() {
     drop(RUNTIME.lock().take());
 
     destroyRenderers();
-
-    if let Some(decoder) = DECODER_REF.lock().take() {
-        let vm = platform::vm();
-        let env = vm.attach_current_thread().unwrap();
-
-        env.call_method(decoder.as_obj(), "stopAndWait", "()V", &[])
-            .unwrap();
-    }
 }
 
 #[no_mangle]
@@ -318,26 +353,12 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn alvr_start_stream(
-    decoder_object: *mut c_void,
     codec: i32,
     real_time: bool,
     swapchain_textures: *mut *const i32,
     swapchain_length: i32,
 ) {
     streamStartNative(swapchain_textures, swapchain_length);
-
-    let vm = platform::vm();
-    let env = vm.get_env().unwrap();
-
-    env.call_method(
-        decoder_object.cast(),
-        "onConnect",
-        "(IZ)V",
-        &[codec.into(), real_time.into()],
-    )
-    .unwrap();
-
-    *DECODER_REF.lock() = Some(env.new_global_ref(decoder_object.cast()).unwrap());
 }
 
 #[no_mangle]
@@ -391,14 +412,19 @@ pub extern "C" fn alvr_send_playspace(width: f32, height: f32) {
 /// Returns frame timestamp in nanoseconds
 #[no_mangle]
 pub unsafe extern "C" fn alvr_wait_for_frame() -> i64 {
-    if let Some(decoder) = &*DECODER_REF.lock() {
-        let vm = platform::vm();
-        let env = vm.get_env().unwrap();
+    let timestamp = if let Some(decoder) = &*DECODER_DEQUEUER.lock() {
+        decoder.dequeue_frame(Duration::from_millis(20)).unwrap()
+    } else {
+        thread::sleep(Duration::from_millis(10));
+        None
+    };
 
-        env.call_method(decoder.as_obj(), "clearAvailable", "()J", &[])
-            .unwrap()
-            .j()
-            .unwrap()
+    if let Some(timestamp) = timestamp {
+        if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
+            stats.report_frame_decoded(timestamp);
+        }
+
+        timestamp.as_nanos() as i64
     } else {
         -1
     }
@@ -440,10 +466,7 @@ pub unsafe extern "C" fn alvr_render_lobby(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn alvr_render_stream(timestamp_ns: i64, swapchain_indices: *const i32) {
-    if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
-        stats.report_frame_decoded(Duration::from_nanos(timestamp_ns as _));
-    }
+pub unsafe extern "C" fn alvr_render_stream(swapchain_indices: *const i32) {
     renderNative(swapchain_indices);
 }
 
@@ -554,34 +577,4 @@ pub extern "C" fn alvr_report_submit(target_timestamp_ns: u64, vsync_queue_ns: u
             }
         }
     }
-}
-
-/// decoder helper
-#[no_mangle]
-pub extern "C" fn alvr_set_waiting_next_idr(waiting: bool) {
-    IDR_PARSED.store(!waiting, Ordering::Relaxed);
-}
-
-/// decoder helper
-#[no_mangle]
-pub extern "C" fn alvr_request_idr() {
-    if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-        sender.send(ClientControlPacket::RequestIdr).ok();
-    }
-}
-
-/// decoder helper
-#[no_mangle]
-pub extern "C" fn alvr_restart_rendering_cycle() {
-    let vm = platform::vm();
-    let env = vm.attach_current_thread().unwrap();
-
-    env.call_method(platform::context(), "restartRenderCycle", "()V", &[])
-        .unwrap();
-}
-
-/// decoder helper
-#[no_mangle]
-pub extern "C" fn alvr_get_stream_texture_handle() -> i32 {
-    *STREAM_TEAXTURE_HANDLE.lock()
 }

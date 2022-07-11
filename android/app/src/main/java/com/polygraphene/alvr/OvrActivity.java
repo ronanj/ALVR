@@ -5,10 +5,12 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.graphics.SurfaceTexture;
 import android.os.BatteryManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.util.Log;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -60,7 +62,6 @@ public class OvrActivity extends Activity {
     Handler mRenderingHandler;
     HandlerThread mRenderingHandlerThread;
     Surface mScreenSurface;
-    DecoderThread mDecoderThread = null;
     float mRefreshRate = 60f;
 
     // Cache method references for performance reasons
@@ -133,7 +134,7 @@ public class OvrActivity extends Activity {
             e.printStackTrace();
         }
         mRenderingHandler.post(() -> {
-            Utils.logi(TAG, () -> "Destroying vrapi state.");
+            Log.i(TAG, "Destroying vrapi state.");
             destroyNative();
             sem.release();
         });
@@ -150,16 +151,10 @@ public class OvrActivity extends Activity {
 
     private void render() {
         if (mResumed && mScreenSurface != null) {
-            if (isConnectedNative()) {
-                renderNative();
+            renderNative();
 
-                mRenderingHandler.removeCallbacks(mRenderRunnable);
-                mRenderingHandler.postDelayed(mRenderRunnable, 1);
-            } else {
-                renderLoadingNative();
-                mRenderingHandler.removeCallbacks(mRenderRunnable);
-                mRenderingHandler.postDelayed(mRenderRunnable, (long) (1f / mRefreshRate));
-            }
+            mRenderingHandler.removeCallbacks(mRenderRunnable);
+            mRenderingHandler.post(mRenderRunnable);
         }
     }
 
@@ -167,21 +162,16 @@ public class OvrActivity extends Activity {
 
     native void destroyNative();
 
-    // nal_class is needed to access NAL objects fields in native code without access to a Java thread
     native void onResumeNative(Surface screenSurface);
 
     native void onPauseNative();
 
-    native void onStreamStartNative(int eyeWidth, int eyeHeight, float fps, DecoderThread decoder,
+    native void onStreamStartNative(int eyeWidth, int eyeHeight, float fps,
                                     int codec, boolean realtimeDecoder, int oculusFoveationLevel,
                                     boolean dynamicOculusFoveation, boolean extraLatency,
                                     float controllerPredictionMultiplier);
 
-    native boolean isConnectedNative();
-
     native void renderNative();
-
-    native void renderLoadingNative();
 
     native void onBatteryChangedNative(int battery, boolean plugged);
 
@@ -191,16 +181,14 @@ public class OvrActivity extends Activity {
                                   boolean dynamicOculusFoveation, boolean extraLatency,
                                   float controllerPredictionMultiplier) {
         mRefreshRate = fps;
-        mRenderingHandler.post(() -> {
-            mDecoderThread = new DecoderThread();
-            onStreamStartNative(eyeWidth, eyeHeight, fps, mDecoderThread, codec, realtimeDecoder,
-            oculusFoveationLevel, dynamicOculusFoveation, extraLatency,controllerPredictionMultiplier);
-        });
+        mRenderingHandler.post(() -> onStreamStartNative(eyeWidth, eyeHeight, fps, codec, realtimeDecoder,
+                oculusFoveationLevel, dynamicOculusFoveation, extraLatency, controllerPredictionMultiplier));
     }
 
     @SuppressWarnings("unused")
-    public void restartRenderCycle() {
-        mRenderingHandler.removeCallbacks(mRenderRunnable);
-        mRenderingHandler.post(mRenderRunnable);
+    public static void registerSurfaceTextureCallback(SurfaceTexture surfaceTexture, int id) {
+        surfaceTexture.setOnFrameAvailableListener(_tex -> surfaceTextureFrameAvailable(id));
     }
+
+    static native void surfaceTextureFrameAvailable(int id);
 }

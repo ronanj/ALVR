@@ -63,4 +63,5 @@ extern "C" void closeSocket();
 extern "C" unsigned long long (*pathStringToHash)(const char *path);
 
 extern "C" void (*videoErrorReportSend)();
+extern "C" void (*createDecoder)(const char *csd_0, int length);
 extern "C" void (*pushNal)(const char *buffer, int length, unsigned long long frameIndex);
